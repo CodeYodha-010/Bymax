@@ -1,4 +1,7 @@
+
 # Bymax
+
+> **Note:** This project is currently in the early stages of development. Active coding and feature implementation have not yet begun. The repository serves as a foundation for future work, and contributions or feedback are welcome as the project evolves.
 
 Baymax is an AI agent designed for large data analysis, capable of automating up to 40% of a data analyst's tasks. It provides an intuitive interface and leverages AI to assist with data exploration, visualization, and reporting.
 
