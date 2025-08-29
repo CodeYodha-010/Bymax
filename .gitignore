@@ -1,3 +1,6 @@
+# Ignore all .env files
+.env
+Baymax/.env
 .aider*
 .env
 *.env

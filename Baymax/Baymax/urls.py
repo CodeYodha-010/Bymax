@@ -21,5 +21,5 @@ from . import views
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('', views.baymax_view, name='baymax'),
-    path('upload/', include('apps.TestAgent.urls', namespace='TestAgent')),
+    path('upload/', include('apps.TableAgent.urls')),
 ]

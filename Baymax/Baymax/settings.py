@@ -3,9 +3,9 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
-
+# Load environment variables from the parent directory
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR.parent / '.env')
 
 SECRET_KEY = 'django-insecure-fzd1zb7vr6omih3brfklvcn5r#c25-(a@a0%fj6__*wckgd57!'
 DEBUG = True
@@ -18,7 +18,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'apps.TestAgent',
+    'apps.TableAgent',
+    
 ]
 
 MIDDLEWARE = [
@@ -97,6 +98,13 @@ NVIDIA_NIM_MODEL = os.getenv(
     'meta/llama-3.1-405b-instruct'
 )
 
+# 6. OpenRouter API for enhanced intent analysis
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+OPENROUTER_MODEL = os.getenv(
+    'OPENROUTER_MODEL',
+    'qwen/qwen-2.5-72b-instruct:free'
+)
+
 # --- END SPEED OPTIMIZATIONS ---
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -114,6 +122,9 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
