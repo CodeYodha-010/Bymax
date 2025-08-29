@@ -1,3 +1,10 @@
+# Ignore database files
+db.sqlite3
+user_data.db
+Baymax/db.sqlite3
+Baymax/user_data.db
+*.sqlite3
+*.db
 # Ignore all .env files
 .env
 Baymax/.env
