@@ -4,14 +4,17 @@ import hashlib
 import logging
 import pandas as pd
 import duckdb
-import requests
+import httpx
 import json
 import re
+import asyncio
 from django.shortcuts import render, redirect
 from django.contrib import messages
 from django.conf import settings
 from django.urls import reverse
 from . import forms
+from . import prompts
+from asgiref.sync import sync_to_async
 
 # --- Logging Setup ---
 logger = logging.getLogger(__name__)
@@ -27,105 +30,129 @@ def get_duckdb_connection(request):
     request.session['duckdb_table_name'] = table_name
     return con, table_name
 
+import tempfile
+
 # --- Enhanced Data Profiling Function ---
-def perform_enhanced_profiling(con, table_name, df, request):
-    """Analyzes the uploaded data and stores metadata."""
+def perform_enhanced_profiling(con, table_name, request, df=None):
+    """Analyzes uploaded data and stores metadata. Handles both DataFrame and DB table sources."""
+    # 1. Get basic info and column types
+    if df is not None:
+        columns = df.columns.tolist()
+        total_rows = len(df)
+        pandas_dtypes = {col: str(df[col].dtype) for col in columns}
+    else:
+        columns = [desc[0] for desc in con.execute(f"DESCRIBE {table_name}").fetchall()]
+        total_rows = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        pandas_dtypes = {}  # Not available without pandas DataFrame
+
     table_metadata = {
-        'basic_info': {
-            'total_rows': len(df),
-            'total_columns': len(df.columns),
-            'column_names': df.columns.tolist()
-        },
+        'basic_info': {'total_rows': total_rows, 'total_columns': len(columns), 'column_names': columns},
         'columns': {}
     }
+    logger.info(f"Starting optimized enhanced profiling for table: {table_name}")
 
-    logger.info(f"Starting enhanced profiling for table: {table_name}")
     try:
-        for col in df.columns:
+        duckdb_types_results = con.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}'").fetchall()
+        duckdb_types = {name: dtype for name, dtype in duckdb_types_results}
+        numeric_duckdb_types = ['BIGINT', 'INTEGER', 'SMALLINT', 'TINYINT', 'UBIGINT', 'UINTEGER', 'USMALLINT', 'UTINYINT', 'DECIMAL', 'DOUBLE', 'FLOAT', 'REAL']
+
+        # 2. Build and execute a single query for all stats
+        stat_queries = []
+        for col in columns:
+            safe_col = f'"{col}"'
+            is_numeric = duckdb_types.get(col) in numeric_duckdb_types
+
+            numeric_part = f"""
+                MIN({safe_col}) as min_val, MAX({safe_col}) as max_val, AVG({safe_col}) as avg_val,
+                STDDEV_SAMP({safe_col}) as stddev_val, COUNT({safe_col}) as non_null_count, NULL as top_values
+            """ if is_numeric else f"""
+                NULL as min_val, NULL as max_val, NULL as avg_val,
+                NULL as stddev_val, NULL as non_null_count,
+                (SELECT list(STRUCT_PACK(value := {safe_col}, count := count)) FROM (SELECT {safe_col}, COUNT(*) as count FROM {table_name} WHERE {safe_col} IS NOT NULL GROUP BY {safe_col} ORDER BY count DESC LIMIT 10)) as top_values
+            """
+
+            query = f"""
+            SELECT
+                '{col.replace("'", "''")}' as column_name,
+                (SELECT list(DISTINCT {safe_col}) FROM {table_name} WHERE {safe_col} IS NOT NULL LIMIT 5) as sample_values,
+                COUNT(DISTINCT {safe_col}) as distinct_count,
+                {numeric_part}
+            FROM {table_name}
+            """
+            stat_queries.append(query)
+
+        if not stat_queries: return False
+
+        full_query = "\nUNION ALL\n".join(stat_queries)
+        all_stats = con.execute(full_query).fetchall()
+        stats_map = {row[0]: row for row in all_stats}
+
+        # 3. Populate metadata from the single query result
+        for col in columns:
+            stats_row = stats_map.get(col)
+            if not stats_row: continue
+
             col_metadata = {
-                'name': col,
-                'dtype_pandas': str(df[col].dtype),
-                'dtype_duckdb': None,
-                'semantic_type': 'unknown',
-                'stats': {},
-                'distinct_count': None,
-                'top_values': [],
-                'sample_values': []
+                'name': col, 'dtype_pandas': pandas_dtypes.get(col), 'dtype_duckdb': duckdb_types.get(col),
+                'semantic_type': 'unknown', 'stats': {}, 'distinct_count': stats_row[2],
+                'top_values': [{'value': r['value'], 'count': r['count']} for r in stats_row[8]] if stats_row[8] else [],
+                'sample_values': [v for v in stats_row[1]]
             }
 
-            dtype_result = con.execute(f"SELECT data_type FROM information_schema.columns WHERE table_name = '{table_name}' AND column_name = '{col}'").fetchone()
-            if dtype_result:
-                col_metadata['dtype_duckdb'] = dtype_result[0]
-
-            sample_vals = con.execute(f"SELECT DISTINCT {col} FROM {table_name} WHERE {col} IS NOT NULL LIMIT 5").fetchall()
-            col_metadata['sample_values'] = [row[0] for row in sample_vals]
-
-            # Enhanced semantic type inference
+            # 4. Perform semantic type inference
             col_name_lower = col.lower()
-            if 'id' in col_name_lower or 'identifier' in col_name_lower:
-                col_metadata['semantic_type'] = 'identifier'
-            elif any(keyword in col_name_lower for keyword in ['date', 'time', 'year', 'month']):
+            if 'id' in col_name_lower or 'identifier' in col_name_lower: col_metadata['semantic_type'] = 'identifier'
+            elif any(kw in col_name_lower for kw in ['date', 'time', 'year', 'month']): col_metadata['semantic_type'] = 'temporal'
+            elif df is not None and duckdb_types.get(col) == 'VARCHAR' and df[col].astype(str).str.match(r'^\d{4}-\d{2}-\d{2}', na=False).any():
                 col_metadata['semantic_type'] = 'temporal'
-            elif col_metadata['dtype_duckdb'] == 'VARCHAR' and df[col].astype(str).str.match(r'^\d{4}-\d{2}-\d{2}', na=False).any():
-                col_metadata['semantic_type'] = 'temporal'
-            elif any(keyword in col_name_lower for keyword in ['count', 'number', 'amount', 'price', 'score', 'rate']):
-                col_metadata['semantic_type'] = 'numerical'
-            elif any(keyword in col_name_lower for keyword in ['category', 'bucket', 'type', 'status', 'department', 'organisation', 'title', 'technology', 'problem', 'statement', 'description']):
+            elif any(kw in col_name_lower for kw in ['count', 'number', 'amount', 'price', 'score', 'rate']): col_metadata['semantic_type'] = 'numerical'
+            elif any(kw in col_name_lower for kw in ['category', 'bucket', 'type', 'status', 'department', 'organisation', 'title', 'technology', 'problem', 'statement', 'description']):
                 col_metadata['semantic_type'] = 'categorical'
 
-            if pd.api.types.is_numeric_dtype(df[col]) or col_metadata['semantic_type'] == 'numerical':
+            is_numeric_final = (df is not None and pd.api.types.is_numeric_dtype(df[col])) or col_metadata['semantic_type'] == 'numerical'
+            if is_numeric_final:
                 col_metadata['semantic_type'] = 'numerical'
-                stats_query = f"""
-                    SELECT
-                        MIN({col}) as min_val,
-                        MAX({col}) as max_val,
-                        AVG({col}) as avg_val,
-                        STDDEV_SAMP({col}) as stddev_val,
-                        COUNT({col}) as non_null_count
-                    FROM {table_name}
-                """
-                stats_result = con.execute(stats_query).fetchone()
-                if stats_result:
-                    col_metadata['stats'] = {
-                        'min': stats_result[0], 'max': stats_result[1],
-                        'mean': stats_result[2], 'stddev': stats_result[3],
-                        'count': stats_result[4]
-                    }
-            else:
-                if col_metadata['semantic_type'] == 'unknown':
-                    col_metadata['semantic_type'] = 'text'
-                distinct_count_result = con.execute(f"SELECT COUNT(DISTINCT {col}) FROM {table_name}").fetchone()
-                col_metadata['distinct_count'] = distinct_count_result[0] if distinct_count_result else 0
-
-                if col_metadata['distinct_count'] > 0 and col_metadata['distinct_count'] <= 50:
-                    top_values_query = f"""
-                        SELECT {col}, COUNT(*) as freq
-                        FROM {table_name}
-                        GROUP BY {col}
-                        ORDER BY freq DESC
-                        LIMIT 10
-                    """
-                    top_values_result = con.execute(top_values_query).fetchall()
-                    col_metadata['top_values'] = [{'value': row[0], 'count': row[1]} for row in top_values_result]
+                if stats_row and stats_row[3] is not None:
+                    col_metadata['stats'] = {'min': stats_row[3], 'max': stats_row[4], 'mean': stats_row[5], 'stddev': stats_row[6], 'count': stats_row[7]}
+            elif col_metadata['semantic_type'] == 'unknown':
+                col_metadata['semantic_type'] = 'text'
 
             table_metadata['columns'][col] = col_metadata
 
         request.session['table_metadata'] = table_metadata
-        logger.info(f"Enhanced profiling complete for table: {table_name}")
+        logger.info(f"Optimized enhanced profiling complete for table: {table_name}")
         return True
     except Exception as e:
-        logger.error(f"Error during enhanced profiling for table {table_name}: {e}")
+        logger.error(f"Error during optimized enhanced profiling for table {table_name}: {e}", exc_info=True)
         return False
 
-# --- ADVANCED: Intent Classification Function ---
-def classify_question_intent(question, table_metadata):
-    """Advanced intent classification with better context understanding."""
+# --- ASYNC NVIDIA API Caller ---
+async def call_nvidia_api_async(payload, timeout=60):
+    """Asynchronously calls the NVIDIA NIM API."""
     api_key = getattr(settings, 'NVIDIA_NIM_API_KEY', None)
     api_endpoint = getattr(settings, 'NVIDIA_NIM_API_ENDPOINT', 'https://integrate.api.nvidia.com/v1/chat/completions')
     if not api_key:
-        logger.error("NVIDIA_NIM_API_KEY not found for intent classification.")
-        return None
+        raise ValueError("NVIDIA_NIM_API_KEY not found in Django settings.")
 
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(api_endpoint, headers=headers, json=payload, timeout=timeout)
+            response.raise_for_status()
+            response_data = response.json()
+            return response_data.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error in async NVIDIA API call: {e}")
+            return None
+
+
+# --- ADVANCED: Intent Classification Function ---
+async def classify_question_intent_async(question, table_metadata):
+    """Asynchronously classifies question intent."""
     # Prepare enhanced context from metadata
     schema_summary = []
     for col_name, col_meta in table_metadata.get('columns', {}).items():
@@ -140,63 +167,29 @@ def classify_question_intent(question, table_metadata):
         schema_summary.append(summary_line)
     schema_info_str = "\n".join(schema_summary)
 
-    intent_prompt = f"""
-    You are an advanced AI assistant analyzing user questions about a dataset.
+    intent_prompt = prompts.INTENT_CLASSIFICATION_PROMPT.format(
+        schema_info=schema_info_str,
+        question=question
+    )
 
-    Dataset Schema Summary:
-    {schema_info_str}
-
-    User Question: {question}
-
-    Analyze this question and provide detailed classification:
-
-    1. Intent Category: Choose from [Simple_Lookup, Count_Aggregation, Filtering, Comparison, Trend_Analysis, Statistical_Analysis, Text_Search, Data_Exploration, Complex_Query]
-    2. Key Entities: Identify specific columns, values, or concepts mentioned
-    3. Query Complexity: Rate as [Low, Medium, High] based on required operations
-    4. Expected Result Type: [Single_Value, List, Table, Summary, Analysis]
-    5. Suggested SQL Approach: Outline the main SQL operations needed
-    6. Potential Challenges: Identify any data type issues or complex requirements
-    7. Result Validation: How to verify the answer matches the user's intent
-
-    Format as JSON:
-    {{
-      "intent_category": "...",
-      "key_entities": ["...", "..."],
-      "query_complexity": "...",
-      "expected_result_type": "...",
-      "suggested_approach": ["...", "..."],
-      "potential_challenges": ["...", "..."],
-      "result_validation": "..."
-    }}
-    """
-
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json'
-    }
     payload = {
         "model": getattr(settings, 'NVIDIA_NIM_MODEL', 'meta/llama-3.1-405b-instruct'),
         "messages": [
             {"role": "system", "content": "You are an expert data analyst. Respond only with valid JSON for query classification."},
             {"role": "user", "content": intent_prompt}
         ],
-        "temperature": 0.1,
-        "max_tokens": 700,
-        "top_p": 1,
-        "stream": False
+        "temperature": 0.1, "max_tokens": 700, "top_p": 1, "stream": False
     }
 
     try:
-        response = requests.post(api_endpoint, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        response_data = response.json()
-        intent_json_str = response_data.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
-        intent_data = json.loads(intent_json_str)
-        logger.debug(f"Advanced intent classified: {intent_data}")
-        return intent_data
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError) as e:
-        logger.error(f"Error in advanced intent classification: {e}")
-        return None
+        intent_json_str = await call_nvidia_api_async(payload)
+        if intent_json_str:
+            intent_data = json.loads(intent_json_str)
+            logger.debug(f"Advanced intent classified: {intent_data}")
+            return intent_data
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding intent JSON: {e}")
+    return None
 
 # --- ADVANCED: Result Formatter ---
 def format_advanced_response(question, query_result_data, result_columns, intent_data, safe_sql):
@@ -407,42 +400,51 @@ def upload_file(request):
                 uploaded_file = request.FILES['file']
                 file_extension = uploaded_file.name.split('.')[-1].lower()
 
+                con, table_name = get_duckdb_connection(request)
+                profiling_success = False
+                columns = []
+
                 if file_extension == 'csv':
-                    df = pd.read_csv(uploaded_file, on_bad_lines='skip')
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_f:
+                        for chunk in uploaded_file.chunks():
+                            temp_f.write(chunk)
+                        temp_file_path = temp_f.name
+
+                    logger.info(f"Loading CSV from {temp_file_path} into DuckDB table: {table_name}")
+                    con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM read_csv_auto('{temp_file_path}')")
+                    os.remove(temp_file_path)
+
+                    profiling_success = perform_enhanced_profiling(con, table_name, request)
+
                 elif file_extension in ['xlsx', 'xls']:
                     df = pd.read_excel(uploaded_file)
+                    if df.empty:
+                        raise ValueError("The uploaded Excel file is empty or could not be parsed.")
+
+                    logger.info(f"Loading Excel data into DuckDB table: {table_name}")
+                    con.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    con.register('temp_df', df)
+                    con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM temp_df")
+                    con.unregister('temp_df')
+
+                    profiling_success = perform_enhanced_profiling(con, table_name, request, df=df)
                 else:
                     messages.error(request, 'Unsupported file format. Please upload CSV or Excel files.')
-                    logger.warning(f"Unsupported file format uploaded: {file_extension}")
                     return render(request, 'upload.html', {'form': form})
 
-                if df.empty:
-                    messages.error(request, 'The uploaded file is empty or could not be parsed.')
-                    logger.warning("Uploaded file was empty or could not be parsed.")
-                    return render(request, 'upload.html', {'form': form})
-
-                con, table_name = get_duckdb_connection(request)
-                logger.info(f"Loading data into DuckDB table: {table_name}")
-
-                con.register('temp_df', df)
-                con.execute(f"DROP TABLE IF EXISTS {table_name}")
-                con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM temp_df")
-                con.unregister('temp_df')
-
-                profiling_success = perform_enhanced_profiling(con, table_name, df, request)
                 if not profiling_success:
                     messages.warning(request, 'File uploaded, but detailed data analysis failed. Some advanced features might be limited.')
 
+                # Get column names from the created table
+                columns = [desc[0] for desc in con.execute(f"DESCRIBE {table_name}").fetchall()]
                 con.close()
 
-                request.session['columns'] = df.columns.tolist()
+                request.session['columns'] = columns
                 request.session['table_loaded'] = True
-                if 'table_data' in request.session:
-                    del request.session['table_data']
-                if 'chat_history' in request.session:
-                    del request.session['chat_history']
+                if 'table_data' in request.session: del request.session['table_data']
+                if 'chat_history' in request.session: del request.session['chat_history']
 
-                messages.success(request, "File uploaded successfully and analyzed with advanced profiling.")
+                messages.success(request, "File uploaded and analyzed successfully.")
                 logger.info("File uploaded and data analyzed successfully.")
                 return redirect('TestAgent:askquestion')
 
@@ -452,13 +454,12 @@ def upload_file(request):
                 logger.error(f"Upload error: {str(e)}", exc_info=True)
         else:
             messages.error(request, 'Please correct the errors below.')
-            logger.warning(f"Upload form errors: {form.errors}")
     else:
         form = forms.UploadFileForm()
     return render(request, 'upload.html', {'form': form})
 
 # --- ADVANCED ASK QUESTION VIEW ---
-def askquestion(request):
+async def askquestion(request):
     if not request.session.session_key:
         messages.error(request, "Session expired or not found. Please re-upload your data.")
         logger.warning("Session key missing in askquestion.")
@@ -483,7 +484,7 @@ def askquestion(request):
         con, _ = get_duckdb_connection(request)
         logger.debug(f"Using DuckDB table for query: {table_name}")
 
-        table_exists_result = con.execute("""
+        table_exists_result = await sync_to_async(con.execute)("""
             SELECT COUNT(*) AS count
             FROM information_schema.tables
             WHERE table_name = ?
@@ -498,22 +499,9 @@ def askquestion(request):
                     del request.session[key]
             return redirect('TestAgent:upload')
 
-        row_count_result = con.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+        row_count_result = await sync_to_async(con.execute)(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
         row_count = row_count_result[0] if row_count_result else 0
         data_points = row_count * len(columns)
-
-        # Get sample data for context
-        sample_df = con.execute(f"SELECT * FROM {table_name} LIMIT 2").fetchdf()
-        sample_data_str = "No data available."
-        if not sample_df.empty:
-            max_col_width = 50
-            truncated_sample_df = sample_df.copy()
-            for col in truncated_sample_df.columns:
-                if truncated_sample_df[col].dtype == "object":
-                    truncated_sample_df[col] = truncated_sample_df[col].apply(
-                        lambda x: (str(x)[:max_col_width] + '...') if isinstance(x, str) and len(str(x)) > max_col_width else str(x)
-                    )
-            sample_data_str = truncated_sample_df.to_string(index=False)
 
     except Exception as e:
         error_msg = f"Error retrieving table information: {e}"
@@ -523,7 +511,7 @@ def askquestion(request):
     finally:
         if con:
             try:
-                con.close()
+                await sync_to_async(con.close)()
             except Exception as close_error:
                 logger.warning(f"Error closing DuckDB connection: {close_error}")
 
@@ -538,7 +526,7 @@ def askquestion(request):
                 
                 # STEP 1: Enhanced Intent Classification
                 logger.info(f"Processing advanced query: {question}")
-                intent_data = classify_question_intent(question, table_metadata)
+                intent_data = await classify_question_intent_async(question, table_metadata)
                 
                 # STEP 2: Conversational History
                 chat_history = request.session.get('chat_history', [])
@@ -573,58 +561,25 @@ Query Analysis:
 - Approach: {'; '.join(intent_data.get('suggested_approach', []))}
 """
 
-                sql_generation_prompt = f"""
-You are an expert SQL analyst for DuckDB. Generate a precise, optimized query.
+                sql_generation_prompt = prompts.SQL_GENERATION_PROMPT.format(
+                    table_name=table_name,
+                    schema_info=enhanced_schema_info,
+                    intent_context=intent_context,
+                    history_str=history_str,
+                    question=question
+                )
 
-Table: '{table_name}'
-Schema with Context:
-{enhanced_schema_info}
-
-{intent_context}
-
-{history_str}
-
-Current Question: {question}
-
-Requirements:
-1. Generate ONLY a valid DuckDB SQL query - no explanations, no markdown
-2. Use proper data type casting when needed (e.g., CAST(column AS DATE))
-3. For text searches, use ILIKE for case-insensitive matching
-4. For complex filters, consider multiple conditions
-5. Add appropriate LIMIT if result set might be very large
-6. Optimize for the expected result type
-
-Query:"""
-
-                # Generate SQL
-                api_key = getattr(settings, 'NVIDIA_NIM_API_KEY', None)
-                api_endpoint = getattr(settings, 'NVIDIA_NIM_API_ENDPOINT', 'https://integrate.api.nvidia.com/v1/chat/completions')
-
-                if not api_key:
-                    raise ValueError("NVIDIA_NIM_API_KEY not found in Django settings.")
-
-                headers = {
-                    'Authorization': f'Bearer {api_key}',
-                    'Content-Type': 'application/json'
-                }
-                
                 sql_payload = {
                     "model": getattr(settings, 'NVIDIA_NIM_MODEL', 'meta/llama-3.1-405b-instruct'),
                     "messages": [
                         {"role": "system", "content": "You are an expert SQL generator. Output only clean SQL queries without markdown or explanations."},
                         {"role": "user", "content": sql_generation_prompt}
                     ],
-                    "temperature": 0.1,
-                    "max_tokens": 600,
-                    "top_p": 1,
-                    "stream": False
+                    "temperature": 0.1, "max_tokens": 600, "top_p": 1, "stream": False
                 }
 
                 logger.debug("Generating advanced SQL query...")
-                sql_response = requests.post(api_endpoint, headers=headers, json=sql_payload, timeout=120)
-                sql_response.raise_for_status()
-                sql_response_data = sql_response.json()
-                generated_sql_raw = sql_response_data.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
+                generated_sql_raw = await call_nvidia_api_async(sql_payload, timeout=120)
 
                 if not generated_sql_raw:
                     raise ValueError("LLM returned an empty SQL query.")
@@ -654,40 +609,37 @@ Query:"""
                 # STEP 4: Execute SQL with Smart Retry
                 con, _ = get_duckdb_connection(request)
                 try:
-                    result_cursor = con.execute(safe_sql)
-                    query_result_data = result_cursor.fetchall()
+                    result_cursor = await sync_to_async(con.execute)(safe_sql)
+                    query_result_data = await sync_to_async(result_cursor.fetchall)()
                     result_columns = [desc[0] for desc in result_cursor.description]
                 except duckdb.Error as e:
                     logger.warning(f"SQL execution failed: {e}")
                     # Smart retry for common issues
                     if "Binder Error" in str(e):
-                        retry_prompt = f"""
-The query failed with: {e}
-Original query: {safe_sql}
-User question: {question}
-
-Fix this query by adding proper type casting or correcting column references.
-Return ONLY the corrected SQL:"""
-
+                        retry_prompt = prompts.SQL_RETRY_PROMPT.format(
+                            error=e,
+                            sql=safe_sql,
+                            question=question
+                        )
                         sql_payload["messages"] = [
                             {"role": "system", "content": "Fix the SQL query. Return only corrected SQL."},
                             {"role": "user", "content": retry_prompt}
                         ]
                         
-                        retry_response = requests.post(api_endpoint, headers=headers, json=sql_payload, timeout=60)
-                        retry_response.raise_for_status()
-                        corrected_sql = retry_response.json().get('choices', [{}])[0].get('message', {}).get('content', '').strip()
-                        
+                        corrected_sql_raw = await call_nvidia_api_async(sql_payload, timeout=60)
+                        if not corrected_sql_raw:
+                            raise e
+
                         # Clean corrected SQL
-                        if corrected_sql.startswith("```sql"):
-                            corrected_sql = corrected_sql[6:].lstrip()
-                        if corrected_sql.endswith("```"):
-                            corrected_sql = corrected_sql[:-3].rstrip()
-                        safe_sql = corrected_sql.strip()
+                        if corrected_sql_raw.startswith("```sql"):
+                            corrected_sql_raw = corrected_sql_raw[6:].lstrip()
+                        if corrected_sql_raw.endswith("```"):
+                            corrected_sql_raw = corrected_sql_raw[:-3].rstrip()
+                        safe_sql = corrected_sql_raw.strip()
                         
                         logger.info(f"Retrying with corrected SQL: {safe_sql}")
-                        result_cursor = con.execute(safe_sql)
-                        query_result_data = result_cursor.fetchall()
+                        result_cursor = await sync_to_async(con.execute)(safe_sql)
+                        query_result_data = await sync_to_async(result_cursor.fetchall)()
                         result_columns = [desc[0] for desc in result_cursor.description]
                     else:
                         raise e
@@ -731,10 +683,10 @@ Return ONLY the corrected SQL:"""
                     display_df = pd.DataFrame(natural_response['table_data'], columns=result_columns)
                 else:
                     # Show general data preview
-                    display_df = con.execute(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
+                    display_df = await sync_to_async(con.execute)(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
                 
                 table_html = display_df.to_html(classes='cyber-table table table-striped', escape=False, index=False)
-                con.close()
+                await sync_to_async(con.close)()
 
                 return render(request, 'ask.html', {
                     'form': form,
@@ -748,28 +700,25 @@ Return ONLY the corrected SQL:"""
                     'advanced_mode': True
                 })
 
-            except requests.exceptions.RequestException as req_e:
-                error_msg = f"Error communicating with AI service: {req_e}"
-                logger.error(f"API Error: {req_e}", exc_info=True)
-            except ValueError as val_e:
-                error_msg = f"Error processing your request: {val_e}"
-                logger.error(f"Processing Error: {val_e}", exc_info=True)
+            except (httpx.RequestError, ValueError) as e:
+                error_msg = f"Error processing your request: {e}"
+                logger.error(f"Processing Error: {e}", exc_info=True)
             except Exception as e:
                 error_msg = f"An unexpected error occurred. Please try again."
                 logger.critical(f"Unexpected Error: {e}", exc_info=True)
             finally:
                 if con:
                     try:
-                        con.close()
+                        await sync_to_async(con.close)()
                     except Exception:
                         pass
 
             # Error handling - show preview table
             try:
                 con, _ = get_duckdb_connection(request)
-                preview_df = con.execute(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
+                preview_df = await sync_to_async(con.execute)(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
                 table_html = preview_df.to_html(classes='cyber-table table table-striped', escape=False, index=False)
-                con.close()
+                await sync_to_async(con.close)()
             except Exception:
                 table_html = "<p>Error generating data preview.</p>"
 
@@ -786,9 +735,9 @@ Return ONLY the corrected SQL:"""
     form = forms.AskQuestionForm()
     try:
         con, _ = get_duckdb_connection(request)
-        preview_df = con.execute(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
+        preview_df = await sync_to_async(con.execute)(f"SELECT * FROM {table_name} LIMIT 50").fetchdf()
         table_html = preview_df.to_html(classes='cyber-table table table-striped', escape=False, index=False)
-        con.close()
+        await sync_to_async(con.close)()
     except Exception as e:
         logger.error(f"Error generating preview table: {e}")
         table_html = "<p>Error loading data preview.</p>"
